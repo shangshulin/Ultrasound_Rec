@@ -1,0 +1,474 @@
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import struct
+from scipy import signal
+import re
+
+# -------------------------- 新增：PGM(P5)解析与转换 --------------------------
+def read_pgm_p5(pgm_path):
+    """解析PGM P5文件：读取544字节头，后续数据区为4字节int32"""
+    with open(pgm_path, 'rb') as f:
+        # 1. 读取前544个字节作为文件头
+        header_blob = f.read(544)
+        header_text = header_blob.decode('ascii', errors='ignore')
+        
+        # 提取注释行（以#开头）
+        comments = [l.strip() for l in header_text.splitlines() if l.strip().startswith('#')]
+        
+        # 提取非注释的数据行
+        lines = [l.strip() for l in header_text.splitlines() if l.strip() and not l.startswith('#')]
+        if not lines or not lines[0].startswith('P5'):
+            raise ValueError("PGM格式错误：未在头信息中找到P5标识")
+        
+        # 解析尺寸和最大值
+        try:
+            dims = lines[1].split()
+            width, height = int(dims[0]), int(dims[1])
+            maxval = int(lines[2])
+        except (IndexError, ValueError) as e:
+            raise ValueError(f"PGM头信息解析失败（尺寸或最大值缺失）: {e}")
+        
+        # 2. 寻址到 544 字节开始读取数据区
+        f.seek(544)
+        # 正确方式：数据点为 4 字节，读取为 int32
+        data = np.fromfile(f, dtype=np.int32)
+        
+    # 转换为二维数组 (height, width)
+    expected_size = width * height
+    if data.size < expected_size:
+        print(f"警告：数据区长度({data.size})小于头信息定义的尺寸({expected_size})")
+        # 尽量填充
+        img = np.zeros((height, width), dtype=np.int32)
+        available = min(data.size, expected_size)
+        img.flat[:available] = data[:available]
+    else:
+        img = data[:expected_size].reshape((height, width))
+        
+    header = {
+        "width": width, 
+        "height": height, 
+        "maxval": maxval,
+        "comments": comments  # 确保包含 comments 键
+    }
+    return img, header
+
+def pgm_pixels_to_int16(img, maxval):
+    """
+    处理原始数据。虽然读入是int32，但后续算法(如FIR)对动态范围有要求。
+    这里将其转换为 int32 精度。
+    """
+    # 如果已经是RF原始信号(int32)，通常不需要像8位图像那样-128
+    # 保持为 int32 精度
+    return img.astype(np.int32)
+
+def save_dat_from_array(arr_int32, out_path):
+    """将二维int32数组写出为.dat"""
+    arr_int32.tofile(out_path)
+    return out_path
+
+# -------------------------- 核心算法模块（修正版） --------------------------
+def changeB2T(file_path, n_lines=None, n_samples=None):
+    """读取.dat二进制文件，数据点为4字节int32"""
+    with open(file_path, 'rb') as fid:
+        # 更新为 int32 读取
+        data = np.fromfile(fid, dtype=np.int32)
+    
+    if n_lines is not None and n_samples is not None:
+        total = n_lines * n_samples
+        if data.size < total:
+            # 容错处理
+            actual_lines = data.size // n_samples
+            da = data[:actual_lines * n_samples].reshape((actual_lines, n_samples))
+            return da
+        da = data[:total].reshape((n_lines, n_samples))
+        return da
+    # 回退到历史默认尺寸
+    if data.size >= 240 * 7618:
+        da = data[:240 * 7618].reshape((240, 7618))
+        return da
+    raise ValueError("无法推断DAT尺寸，请提供n_lines与n_samples")
+
+def processF(Data):
+    """单条扫描线数据处理（修正降采样逻辑）"""
+    N = len(Data)
+    # FFT求频域峰值（对齐MATLAB索引）
+    mag = np.abs(np.fft.fft(Data))
+    m = mag.shape[0]
+    # 找前半段最大值索引（MATLAB 1开始，Python+1对齐）
+    max_val = np.max(mag[:int(m/2)])
+    k = np.where(mag[:int(m/2)] == max_val)[0][0] + 1
+    w = -2 * np.pi * k / N
+
+    # 正交解调
+    x = np.arange(N)
+    Q = np.cos(w * x) * Data
+    I = np.sin(w * x) * Data
+
+    # FIR低通滤波
+    T = 1 / 40000
+    f = 100
+    wn = 2 * T * f * 1.001
+    n = 70
+    fir_coeff = signal.firwin(n + 1, wn)  # 低通FIR滤波器
+
+    Qf = signal.fftconvolve(Q, fir_coeff, mode='same')
+    If = signal.fftconvolve(I, fir_coeff, mode='same')
+    Fdata = np.sqrt(Q**2 + I**2)
+
+    # 修正降采样逻辑（严格对齐MATLAB循环）
+    Sdata = []
+    index = 1
+    while True:
+        p = 16 * (index - 1) + 1  # MATLAB 1开始索引
+        if p > N:
+            break
+        Sdata.append(Fdata[p-1])  # 转Python 0索引
+        index += 1
+    Sdata = np.array(Sdata) / 255.0
+
+    # 对数压缩
+    a = 1.5
+    b = 0.02
+    for i in range(len(Sdata)):
+        Sdata[i] = a * np.log(Sdata[i] + 1) + b
+        if Sdata[i] > 255:
+            Sdata[i] = 255
+
+    return Sdata
+
+def frameProcess(file_path, n_lines=None, n_samples=None):
+    """单帧数据处理（从DAT恢复二维数据，支持任意行列）"""
+    data = changeB2T(file_path, n_lines=n_lines, n_samples=n_samples)
+    data = np.abs(data)
+
+    # 处理每条扫描线
+    first_line = processF(data[0, :])
+    Cdata = np.zeros((data.shape[0], len(first_line)))
+    for n in range(data.shape[0]):
+        Cdata[n, :] = processF(data[n, :])
+
+    # 无参数映射，直接使用
+    CData = Cdata
+
+    # 转置（对应MATLAB'）
+    CData = CData.T
+    return CData
+
+def image_reconstruct(d):
+    """图像重建（极坐标转笛卡尔坐标，自动计算尺寸防止裁剪）"""
+    m, n = d.shape
+    
+    # 角度参数
+    total_angle_deg = 68
+    half_angle_rad = (total_angle_deg / 2) / 180 * np.pi
+    deltasita = (total_angle_deg / n) / 180 * np.pi
+    Fsita = (total_angle_deg / 180) * np.pi
+    r = 70  # 起始半径
+    
+    # 1. 计算重建图像所需的实际尺寸
+    R_max = r + m
+    # 扇形在最大深度处的物理宽度
+    max_width = 2 * R_max * np.sin(half_angle_rad)
+    # 扇形在垂直方向的跨度 (从最顶端的弧到最底端的弧)
+    max_height = R_max - r * np.cos(half_angle_rad)
+    
+    new_w = int(np.ceil(max_width)) + 2
+    new_h = int(np.ceil(max_height)) + 2
+    
+    # 初始化重建矩阵（使用较大的尺寸）
+    data = np.ones((new_h, new_w)) * -1
+
+    # 2. 重新定义中心点和偏移量，确保扇形居中且不越界
+    X = new_w // 2
+    # Y 偏移量：使扇形顶部的圆弧恰好对齐图像顶部
+    Y = r * np.cos(half_angle_rad)
+
+    # 极坐标转笛卡尔坐标赋值
+    sita_list = np.arange(deltasita, Fsita + deltasita, deltasita)
+    for sita in sita_list:
+        # 预计算当前角度的三角函数，优化速度
+        alpha = (236 / 180 * np.pi) + sita
+        cos_a = np.cos(alpha)
+        sin_a = np.sin(alpha)
+        
+        for i in range(1, m + 1):
+            R = r + i
+            # 极坐标 -> 笛卡尔
+            px = R * cos_a
+            py = R * sin_a
+            
+            # 映射到图像像素索引（根据新的 X, Y 调整）
+            ix = int(np.floor(px + X))
+            iy = int(np.floor(-py - Y))  # 因为 py 在 236-304度是负值，-py 为正
+            
+            # 边界检查
+            if 0 <= ix < new_w and 0 <= iy < new_h:
+                if data[iy, ix] == -1:
+                    sita_idx = int(np.floor(sita / deltasita))
+                    if 1 <= sita_idx <= n:
+                        data[iy, ix] = d[i-1, sita_idx-1]
+
+    return data
+
+# -------------------------- GUI交互与显示模块（修复版） --------------------------
+class BUSReconstructionApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("B超图像重建系统")
+        self.root.geometry("1200x800")
+        
+        # 绑定窗口关闭事件
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # 存储加载的数据
+        self.frame_data_list = []
+        self.recon_data = None
+        self.reference_image = None
+        self.pgm_header = None
+        self.probe_type = tk.StringVar(value="convex")  # 默认凸阵
+
+        # 控件布局
+        self._create_widgets()
+
+    def _create_widgets(self):
+        # 顶部控制面板
+        top_frame = ttk.Frame(self.root, padding=10)
+        top_frame.pack(side=tk.TOP, fill=tk.X)
+
+        # 第一行：文件上传
+        file_frame = ttk.Frame(top_frame)
+        file_frame.pack(side=tk.LEFT, padx=10)
+        
+        upload_btn = ttk.Button(file_frame, text="上传PGM数据", command=self.upload_pgm_file)
+        upload_btn.pack(side=tk.LEFT, padx=5)
+        
+        ref_btn = ttk.Button(file_frame, text="上传参考图像", command=self.upload_reference_image)
+        ref_btn.pack(side=tk.LEFT, padx=5)
+
+        # 第二行：参数选择与执行
+        action_frame = ttk.Frame(top_frame)
+        action_frame.pack(side=tk.LEFT, padx=30)
+        
+        ttk.Label(action_frame, text="探头类型:").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(action_frame, text="凸阵", variable=self.probe_type, value="convex").pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(action_frame, text="线阵", variable=self.probe_type, value="linear").pack(side=tk.LEFT, padx=2)
+        
+        recon_btn = ttk.Button(action_frame, text="开始重建", command=self.reconstruct_image)
+        recon_btn.pack(side=tk.LEFT, padx=20)
+
+        # 下方图像显示区域 - 只保留重建图像和参考图像对比
+        self.fig = plt.figure(figsize=(14, 7))
+        gs = self.fig.add_gridspec(1, 2, width_ratios=[1, 1], wspace=0.1)
+        
+        self.ax2 = self.fig.add_subplot(gs[0, 0])
+        self.ax3 = self.fig.add_subplot(gs[0, 1])
+        
+        self.ax2.set_title("重建后图像")
+        self.ax3.set_title("参考图像")
+        
+        # 强制绘图区域比例为正方形，方便对比
+        self.ax2.set_box_aspect(1)
+        self.ax3.set_box_aspect(1)
+        
+        # 隐藏坐标轴刻度但保留外框
+        for ax in [self.ax2, self.ax3]:
+            ax.set_xticks([])
+            ax.set_yticks([])
+            # 设置黑色外框
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_color('black')
+                spine.set_linewidth(1.5)
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+
+    def upload_reference_image(self):
+        """上传并显示参考图像"""
+        ref_path = filedialog.askopenfilename(
+            title="选择参考图像文件",
+            filetypes=[("图像文件", "*.bmp *.jpg *.jpeg"), ("所有文件", "*.*")]
+        )
+        if not ref_path:
+            return
+        try:
+            # 使用 matplotlib 读取图像
+            img = plt.imread(ref_path)
+            self.reference_image = img
+            
+            self.ax3.clear()
+            self.ax3.imshow(img)
+            self.ax3.set_title(f"参考图像\n({ref_path.split('/')[-1]})")
+            # 重新应用边框设置（clear会清除spines设置）
+            self.ax3.set_xticks([])
+            self.ax3.set_yticks([])
+            for spine in self.ax3.spines.values():
+                spine.set_visible(True)
+                spine.set_color('black')
+                spine.set_linewidth(1.5)
+            
+            self.ax3.set_box_aspect(1)
+            self.canvas.draw()
+        except Exception as e:
+            messagebox.showerror("错误", f"无法加载参考图像：{str(e)}")
+
+    def upload_pgm_file(self):
+        """上传PGM(P5)文件，解析头信息并转换为DAT"""
+        pgm_path = filedialog.askopenfilename(
+            title="选择PGM格式B超数据文件",
+            filetypes=[("PGM文件", "*.pgm"), ("所有文件", "*.*")]
+        )
+        if not pgm_path:
+            return
+        try:
+            img, header = read_pgm_p5(pgm_path)
+            self.pgm_header = header
+            # 将PGM像素居中为有符号int16
+            signed = pgm_pixels_to_int16(img, header["maxval"])
+            # 行作为扫描线，列为采样点
+            n_lines, n_samples = signed.shape[0], signed.shape[1]
+            # 写出DAT
+            dat_path = pgm_path[:-4] + ".dat"
+            save_dat_from_array(signed, dat_path)
+            # 处理一帧
+            frame_data = frameProcess(dat_path, n_lines=n_lines, n_samples=n_samples)
+            self.frame_data_list = [frame_data]
+            # 信息提示
+            meta_info = ""
+            if header["comments"]:
+                meta_info = "\n".join(header["comments"][:5])
+            messagebox.showinfo(
+                "成功",
+                f"PGM加载完成：{pgm_path}\n尺寸：{header['width']}×{header['height']}\nmaxval：{header['maxval']}\n已生成DAT：{dat_path}\n{meta_info}"
+            )
+            self.show_reconstructed_placeholder()
+        except Exception as e:
+            messagebox.showerror("错误", f"PGM处理失败：{str(e)}")
+
+    def show_reconstructed_placeholder(self):
+        """上传后清空并准备显示"""
+        self.ax2.clear()
+        self.ax2.set_title("重建后图像 (待重建)")
+        self.ax2.set_xticks([])
+        self.ax2.set_yticks([])
+        for spine in self.ax2.spines.values():
+            spine.set_visible(True)
+            spine.set_color('black')
+            spine.set_linewidth(1.5)
+        self.canvas.draw()
+
+    def reconstruct_image(self):
+        """执行图像重建并显示"""
+        if not self.frame_data_list:
+            messagebox.showwarning("警告", "请先上传数据文件！")
+            return
+
+        # 平均后重建
+        d_avg = np.mean(self.frame_data_list, axis=0)
+        
+        # 根据用户选择的探头类型进行重建
+        if self.probe_type.get() == "linear":
+            self.recon_data = image_reconstruct_linear(d_avg)
+            aspect_type = 'auto'  # 线阵通常自适应比例
+        else:
+            self.recon_data = image_reconstruct_convex(d_avg)
+            aspect_type = 'equal' # 凸阵必须等比例保证几何准确
+
+        # 显示重建图像
+        self.ax2.clear()
+        img = np.ma.masked_less(self.recon_data, 0)
+        cm = plt.cm.gray.copy()
+        cm.set_bad(color='black')
+        
+        self.ax2.imshow(img, cmap=cm, origin='upper', aspect=aspect_type, 
+                        interpolation='nearest', extent=[0, img.shape[1], img.shape[0], 0])
+        self.ax2.set_title(f"重建后图像 ({'线阵' if self.probe_type.get() == 'linear' else '凸阵'})")
+        
+        # 重新应用黑色外框
+        self.ax2.set_xticks([])
+        self.ax2.set_yticks([])
+        for spine in self.ax2.spines.values():
+            spine.set_visible(True)
+            spine.set_color('black')
+            spine.set_linewidth(1.5)
+            
+        self.ax2.margins(0)
+        # 移除可能导致警告的 tight_layout，改用 subplots_adjust 手动控制边距
+        self.fig.subplots_adjust(left=0.05, right=0.95, top=0.9, bottom=0.05)
+        self.canvas.draw()
+
+    def on_closing(self):
+        """彻底结束程序进程"""
+        try:
+            self.root.quit()     # 停止 Tkinter 事件循环
+            self.root.destroy()  # 销毁所有窗口组件
+            import sys
+            sys.exit(0)         # 强制退出 Python 解释器，释放终端
+        except Exception:
+            import sys
+            sys.exit(0)
+
+def image_reconstruct_linear(d):
+    """线阵图像重建：直接调整尺寸（甲状腺扫描）"""
+    m, n = d.shape
+    # 线阵通常只需要根据物理尺寸进行插值，这里演示直接返回或简单Resize
+    # 假设线阵需要将扫描线插值到更宽的显示区域
+    target_w = n * 2  # 增加宽度插值
+    target_h = m
+    from scipy.ndimage import zoom
+    # 沿着宽度方向插值
+    recon = zoom(d, (1, target_w/n), order=1)
+    return recon
+
+def image_reconstruct_convex(d):
+    """凸阵图像重建：极坐标转笛卡尔坐标（肝/肾扫描）"""
+    m, n = d.shape
+    # 角度参数
+    total_angle_deg = 68
+    half_angle_rad = (total_angle_deg / 2) / 180 * np.pi
+    deltasita = (total_angle_deg / n) / 180 * np.pi
+    Fsita = (total_angle_deg / 180) * np.pi
+    r = 70  # 起始半径
+    
+    # 1. 计算重建图像所需的实际尺寸
+    R_max = r + m
+    max_width = 2 * R_max * np.sin(half_angle_rad)
+    max_height = R_max - r * np.cos(half_angle_rad)
+    
+    new_w = int(np.ceil(max_width)) + 2
+    new_h = int(np.ceil(max_height)) + 2
+    
+    data = np.ones((new_h, new_w)) * -1
+    X = new_w // 2
+    Y = r * np.cos(half_angle_rad)
+
+    sita_list = np.arange(deltasita, Fsita + deltasita, deltasita)
+    for sita in sita_list:
+        alpha = (236 / 180 * np.pi) + sita
+        cos_a = np.cos(alpha)
+        sin_a = np.sin(alpha)
+        for i in range(1, m + 1):
+            R = r + i
+            px = R * cos_a
+            py = R * sin_a
+            ix = int(np.floor(px + X))
+            iy = int(np.floor(-py - Y))
+            if 0 <= ix < new_w and 0 <= iy < new_h:
+                if data[iy, ix] == -1:
+                    sita_idx = int(np.floor(sita / deltasita))
+                    if 1 <= sita_idx <= n:
+                        data[iy, ix] = d[i-1, sita_idx-1]
+    return data
+
+# -------------------------- 程序入口 --------------------------
+if __name__ == "__main__":
+    # 解决中文显示问题
+    plt.rcParams["font.family"] = "SimHei"
+    plt.rcParams["axes.unicode_minus"] = False
+
+    root = tk.Tk()
+    app = BUSReconstructionApp(root)
+    root.mainloop()
