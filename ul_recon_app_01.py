@@ -31,7 +31,16 @@ def read_pgm_p5(pgm_path):
         except (IndexError, ValueError) as e:
             raise ValueError(f"PGM头信息解析失败（尺寸或最大值缺失）: {e}")
         
-        # 2. 寻址到 544 字节开始读取数据区
+        # 2. 尝试从注释中提取 HalfAngle(rad)
+        half_angle_rad = None
+        for comment in comments:
+            # 匹配模式：HalfAngle(rad): 0.5700
+            match = re.search(r'HalfAngle\(rad\):\s*([\d\.]+)', comment)
+            if match:
+                half_angle_rad = float(match.group(1))
+                break
+        
+        # 3. 寻址到 544 字节开始读取数据区
         f.seek(544)
         # 正确方式：数据点为 4 字节，读取为 int32
         data = np.fromfile(f, dtype=np.int32)
@@ -51,7 +60,8 @@ def read_pgm_p5(pgm_path):
         "width": width, 
         "height": height, 
         "maxval": maxval,
-        "comments": comments  # 确保包含 comments 键
+        "comments": comments,
+        "half_angle_rad": half_angle_rad
     }
     return img, header
 
@@ -157,15 +167,18 @@ def frameProcess(file_path, n_lines=None, n_samples=None):
     CData = CData.T
     return CData
 
-def image_reconstruct(d):
+def image_reconstruct(d, half_angle_rad=None):
     """图像重建（极坐标转笛卡尔坐标，自动计算尺寸防止裁剪）"""
     m, n = d.shape
     
     # 角度参数
-    total_angle_deg = 68
-    half_angle_rad = (total_angle_deg / 2) / 180 * np.pi
-    deltasita = (total_angle_deg / n) / 180 * np.pi
-    Fsita = (total_angle_deg / 180) * np.pi
+    if half_angle_rad is None:
+        total_angle_deg = 68
+        half_angle_rad = (total_angle_deg / 2) / 180 * np.pi
+    
+    total_angle_rad = 2 * half_angle_rad
+    deltasita = total_angle_rad / n
+    Fsita = total_angle_rad
     r = 70  # 起始半径
     
     # 1. 计算重建图像所需的实际尺寸
@@ -186,11 +199,14 @@ def image_reconstruct(d):
     # Y 偏移量：使扇形顶部的圆弧恰好对齐图像顶部
     Y = r * np.cos(half_angle_rad)
 
+    # 动态计算起始角度，确保扇形中心对准 270 度（正下方）
+    start_angle = 1.5 * np.pi - half_angle_rad
+
     # 极坐标转笛卡尔坐标赋值
     sita_list = np.arange(deltasita, Fsita + deltasita, deltasita)
     for sita in sita_list:
         # 预计算当前角度的三角函数，优化速度
-        alpha = (236 / 180 * np.pi) + sita
+        alpha = start_angle + sita
         cos_a = np.cos(alpha)
         sin_a = np.sin(alpha)
         
@@ -218,8 +234,19 @@ class BUSReconstructionApp:
     def __init__(self, root):
         self.root = root
         self.root.title("B超图像重建系统")
-        self.root.geometry("1200x800")
+        self.root.geometry("1600x900")
         
+        # --- 开发者配置区：修改此处即可调整全局界面尺寸 ---
+        UI_FONT_SIZE = 18       # 字体大小
+        BTN_PADDING_XY = (20, 8) # 按钮内边距 (左右, 上下)
+        # ----------------------------------------------
+
+        self.style = ttk.Style()
+        # 设置全局样式
+        self.style.configure(".", font=("SimHei", UI_FONT_SIZE))
+        # 专门设置按钮样式，使其更易点击
+        self.style.configure("TButton", padding=BTN_PADDING_XY)
+
         # 绑定窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -260,14 +287,14 @@ class BUSReconstructionApp:
         recon_btn.pack(side=tk.LEFT, padx=20)
 
         # 下方图像显示区域 - 只保留重建图像和参考图像对比
-        self.fig = plt.figure(figsize=(14, 7))
+        self.fig = plt.figure(figsize=(28, 14))
         gs = self.fig.add_gridspec(1, 2, width_ratios=[1, 1], wspace=0.1)
         
         self.ax2 = self.fig.add_subplot(gs[0, 0])
         self.ax3 = self.fig.add_subplot(gs[0, 1])
         
-        self.ax2.set_title("重建后图像")
-        self.ax3.set_title("参考图像")
+        self.ax2.set_title("重建后图像", fontsize=20)
+        self.ax3.set_title("参考图像", fontsize=20)
         
         # 强制绘图区域比例为正方形，方便对比
         self.ax2.set_box_aspect(1)
@@ -284,7 +311,11 @@ class BUSReconstructionApp:
                 spine.set_linewidth(1.5)
         
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-        self.canvas.get_tk_widget().pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+        
+        # 调整 subplots_adjust 以减少白边，让图像占满画布
+        self.fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.02)
 
     def upload_reference_image(self):
         """上传并显示参考图像"""
@@ -337,12 +368,13 @@ class BUSReconstructionApp:
             frame_data = frameProcess(dat_path, n_lines=n_lines, n_samples=n_samples)
             self.frame_data_list = [frame_data]
             # 信息提示
+            angle_info = f"\n识别到扫描角度 (HalfAngle): {header['half_angle_rad']:.4f} rad" if header.get('half_angle_rad') else "\n未识别到角度信息，将使用默认值"
             meta_info = ""
             if header["comments"]:
                 meta_info = "\n".join(header["comments"][:5])
             messagebox.showinfo(
                 "成功",
-                f"PGM加载完成：{pgm_path}\n尺寸：{header['width']}×{header['height']}\nmaxval：{header['maxval']}\n已生成DAT：{dat_path}\n{meta_info}"
+                f"PGM加载完成：{pgm_path}\n尺寸：{header['width']}×{header['height']}\nmaxval：{header['maxval']}\n已生成DAT：{dat_path}{angle_info}\n\n文件头摘要：\n{meta_info}"
             )
             self.show_reconstructed_placeholder()
         except Exception as e:
@@ -374,7 +406,9 @@ class BUSReconstructionApp:
             self.recon_data = image_reconstruct_linear(d_avg)
             aspect_type = 'auto'  # 线阵通常自适应比例
         else:
-            self.recon_data = image_reconstruct_convex(d_avg)
+            # 提取头信息中的扫描角度
+            half_angle = self.pgm_header.get("half_angle_rad") if self.pgm_header else None
+            self.recon_data = image_reconstruct_convex(d_avg, half_angle_rad=half_angle)
             aspect_type = 'equal' # 凸阵必须等比例保证几何准确
 
         # 显示重建图像
@@ -385,7 +419,17 @@ class BUSReconstructionApp:
         
         self.ax2.imshow(img, cmap=cm, origin='upper', aspect=aspect_type, 
                         interpolation='nearest', extent=[0, img.shape[1], img.shape[0], 0])
-        self.ax2.set_title(f"重建后图像 ({'线阵' if self.probe_type.get() == 'linear' else '凸阵'})")
+        
+        # 在标题中显示角度信息
+        angle_str = ""
+        if self.probe_type.get() == "convex":
+            angle = self.pgm_header.get("half_angle_rad") if self.pgm_header else None
+            if angle:
+                angle_str = f" (角度: {angle:.4f} rad)"
+            else:
+                angle_str = " (角度: 默认 68°)"
+        
+        self.ax2.set_title(f"重建后图像 ({'线阵' if self.probe_type.get() == 'linear' else '凸阵'}){angle_str}")
         
         # 重新应用黑色外框
         self.ax2.set_xticks([])
@@ -423,14 +467,17 @@ def image_reconstruct_linear(d):
     recon = zoom(d, (1, target_w/n), order=1)
     return recon
 
-def image_reconstruct_convex(d):
+def image_reconstruct_convex(d, half_angle_rad=None):
     """凸阵图像重建：极坐标转笛卡尔坐标（肝/肾扫描）"""
     m, n = d.shape
     # 角度参数
-    total_angle_deg = 68
-    half_angle_rad = (total_angle_deg / 2) / 180 * np.pi
-    deltasita = (total_angle_deg / n) / 180 * np.pi
-    Fsita = (total_angle_deg / 180) * np.pi
+    if half_angle_rad is None:
+        total_angle_deg = 68
+        half_angle_rad = (total_angle_deg / 2) / 180 * np.pi
+    
+    total_angle_rad = 2 * half_angle_rad
+    deltasita = total_angle_rad / n
+    Fsita = total_angle_rad
     r = 70  # 起始半径
     
     # 1. 计算重建图像所需的实际尺寸
@@ -445,9 +492,12 @@ def image_reconstruct_convex(d):
     X = new_w // 2
     Y = r * np.cos(half_angle_rad)
 
+    # 动态计算起始角度，确保扇形中心对准 270 度（正下方）
+    start_angle = 1.5 * np.pi - half_angle_rad
+
     sita_list = np.arange(deltasita, Fsita + deltasita, deltasita)
     for sita in sita_list:
-        alpha = (236 / 180 * np.pi) + sita
+        alpha = start_angle + sita
         cos_a = np.cos(alpha)
         sin_a = np.sin(alpha)
         for i in range(1, m + 1):
