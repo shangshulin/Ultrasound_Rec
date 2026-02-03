@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import struct
-from scipy import signal
+from scipy import signal, ndimage
 import re
 
 # -------------------------- 新增：PGM(P5)解析与转换 --------------------------
@@ -168,66 +168,8 @@ def frameProcess(file_path, n_lines=None, n_samples=None):
     return CData
 
 def image_reconstruct(d, half_angle_rad=None):
-    """图像重建（极坐标转笛卡尔坐标，自动计算尺寸防止裁剪）"""
-    m, n = d.shape
-    
-    # 角度参数
-    if half_angle_rad is None:
-        total_angle_deg = 68
-        half_angle_rad = (total_angle_deg / 2) / 180 * np.pi
-    
-    total_angle_rad = 2 * half_angle_rad
-    deltasita = total_angle_rad / n
-    Fsita = total_angle_rad
-    r = 70  # 起始半径
-    
-    # 1. 计算重建图像所需的实际尺寸
-    R_max = r + m
-    # 扇形在最大深度处的物理宽度
-    max_width = 2 * R_max * np.sin(half_angle_rad)
-    # 扇形在垂直方向的跨度 (从最顶端的弧到最底端的弧)
-    max_height = R_max - r * np.cos(half_angle_rad)
-    
-    new_w = int(np.ceil(max_width)) + 2
-    new_h = int(np.ceil(max_height)) + 2
-    
-    # 初始化重建矩阵（使用较大的尺寸）
-    data = np.ones((new_h, new_w)) * -1
-
-    # 2. 重新定义中心点和偏移量，确保扇形居中且不越界
-    X = new_w // 2
-    # Y 偏移量：使扇形顶部的圆弧恰好对齐图像顶部
-    Y = r * np.cos(half_angle_rad)
-
-    # 动态计算起始角度，确保扇形中心对准 270 度（正下方）
-    start_angle = 1.5 * np.pi - half_angle_rad
-
-    # 极坐标转笛卡尔坐标赋值
-    sita_list = np.arange(deltasita, Fsita + deltasita, deltasita)
-    for sita in sita_list:
-        # 预计算当前角度的三角函数，优化速度
-        alpha = start_angle + sita
-        cos_a = np.cos(alpha)
-        sin_a = np.sin(alpha)
-        
-        for i in range(1, m + 1):
-            R = r + i
-            # 极坐标 -> 笛卡尔
-            px = R * cos_a
-            py = R * sin_a
-            
-            # 映射到图像像素索引（根据新的 X, Y 调整）
-            ix = int(np.floor(px + X))
-            iy = int(np.floor(-py - Y))  # 因为 py 在 236-304度是负值，-py 为正
-            
-            # 边界检查
-            if 0 <= ix < new_w and 0 <= iy < new_h:
-                if data[iy, ix] == -1:
-                    sita_idx = int(np.floor(sita / deltasita))
-                    if 1 <= sita_idx <= n:
-                        data[iy, ix] = d[i-1, sita_idx-1]
-
-    return data
+    """图像重建统一接口，内部调用优化后的凸阵重建算法"""
+    return image_reconstruct_convex(d, half_angle_rad)
 
 # -------------------------- GUI交互与显示模块（修复版） --------------------------
 class BUSReconstructionApp:
@@ -456,62 +398,62 @@ class BUSReconstructionApp:
             sys.exit(0)
 
 def image_reconstruct_linear(d):
-    """线阵图像重建：直接调整尺寸（甲状腺扫描）"""
-    m, n = d.shape
-    # 线阵通常只需要根据物理尺寸进行插值，这里演示直接返回或简单Resize
-    # 假设线阵需要将扫描线插值到更宽的显示区域
-    target_w = n * 2  # 增加宽度插值
-    target_h = m
-    from scipy.ndimage import zoom
-    # 沿着宽度方向插值
-    recon = zoom(d, (1, target_w/n), order=1)
+    """线阵图像重建：使用双三次插值优化显示效果"""
+    # 增加插值倍率，使图像更平滑，消除马赛克感
+    # order=3 表示使用双三次插值 (Bicubic)
+    scale_h = 2.0
+    scale_w = 4.0
+    recon = ndimage.zoom(d, (scale_h, scale_w), order=3)
     return recon
 
 def image_reconstruct_convex(d, half_angle_rad=None):
-    """凸阵图像重建：极坐标转笛卡尔坐标（肝/肾扫描）"""
+    """凸阵图像重建：使用反向映射与双线性插值，彻底消除空洞点"""
     m, n = d.shape
-    # 角度参数
     if half_angle_rad is None:
         total_angle_deg = 68
         half_angle_rad = (total_angle_deg / 2) / 180 * np.pi
     
     total_angle_rad = 2 * half_angle_rad
-    deltasita = total_angle_rad / n
-    Fsita = total_angle_rad
-    r = 70  # 起始半径
+    r_start = 70.0  # 起始半径
     
     # 1. 计算重建图像所需的实际尺寸
-    R_max = r + m
+    R_max = r_start + m
     max_width = 2 * R_max * np.sin(half_angle_rad)
-    max_height = R_max - r * np.cos(half_angle_rad)
+    max_height = R_max - r_start * np.cos(half_angle_rad)
     
-    new_w = int(np.ceil(max_width)) + 2
-    new_h = int(np.ceil(max_height)) + 2
+    # 可以通过 res_scale 调整输出分辨率
+    res_scale = 1.0
+    new_w = int(np.ceil(max_width * res_scale)) + 2
+    new_h = int(np.ceil(max_height * res_scale)) + 2
     
-    data = np.ones((new_h, new_w)) * -1
-    X = new_w // 2
-    Y = r * np.cos(half_angle_rad)
-
-    # 动态计算起始角度，确保扇形中心对准 270 度（正下方）
-    start_angle = 1.5 * np.pi - half_angle_rad
-
-    sita_list = np.arange(deltasita, Fsita + deltasita, deltasita)
-    for sita in sita_list:
-        alpha = start_angle + sita
-        cos_a = np.cos(alpha)
-        sin_a = np.sin(alpha)
-        for i in range(1, m + 1):
-            R = r + i
-            px = R * cos_a
-            py = R * sin_a
-            ix = int(np.floor(px + X))
-            iy = int(np.floor(-py - Y))
-            if 0 <= ix < new_w and 0 <= iy < new_h:
-                if data[iy, ix] == -1:
-                    sita_idx = int(np.floor(sita / deltasita))
-                    if 1 <= sita_idx <= n:
-                        data[iy, ix] = d[i-1, sita_idx-1]
-    return data
+    # 2. 建立目标网格 (Cartesian)
+    xv, yv = np.meshgrid(np.arange(new_w), np.arange(new_h))
+    
+    # 中心偏移逻辑
+    X_center = (new_w - 1) / 2.0
+    Y_offset = r_start * np.cos(half_angle_rad)
+    
+    # 物理坐标转换 (以探头顶点为原点)
+    px = xv - X_center
+    py = -yv - Y_offset
+    
+    # 3. 物理坐标 -> 极坐标
+    R = np.sqrt(px**2 + py**2)
+    # theta 是相对于中心轴的角度，范围约 [-half_angle, half_angle]
+    theta = np.arctan2(px, -py)
+    
+    # 4. 极坐标 -> 原始数据索引
+    # R 范围 [r_start, r_start + m] -> 映射到 [0, m-1]
+    row_idx = R - r_start
+    # theta 映射到 [0, n-1]
+    col_idx = (theta + half_angle_rad) / (2 * half_angle_rad) * (n - 1)
+    
+    # 5. 使用 ndimage.map_coordinates 进行双线性插值 (order=1)
+    # order=1 为双线性，若需要更平滑可用 order=3 (双三次)
+    # cval=-1 用于标识背景区域
+    recon = ndimage.map_coordinates(d, [row_idx, col_idx], order=1, mode='constant', cval=-1)
+    
+    return recon
 
 # -------------------------- 程序入口 --------------------------
 if __name__ == "__main__":
